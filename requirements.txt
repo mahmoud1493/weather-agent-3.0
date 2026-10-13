@@ -1,0 +1,7 @@
+streamlit
+langchain
+langgraph
+langchain-google-genai
+langchain-groq
+python-dotenv
+requests
