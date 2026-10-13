@@ -2,6 +2,8 @@
 
 A Streamlit weather assistant built with LangChain, Groq, Gemini, OpenWeatherMap, and LangGraph thread-based conversation memory.
 
+**🔗 Live demo:** [weather-agent-3.0](https://weather-agent-3-mi7773.streamlit.app/)
+
 ## Features
 
 - Uses Groq as the primary language model.
