@@ -1,52 +1,23 @@
-import logging
 import os
-from uuid import uuid4
+import uuid
 
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelFallbackMiddleware
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
 
-from tools import get_location, get_weather
-
-
-logging.getLogger("langchain_google_genai").setLevel(logging.ERROR)
 
 load_dotenv()
 
 
-st.set_page_config(
-    page_title="Weather Agent",
-    page_icon="🌦️",
-)
-
-st.title("🌦️ Weather Agent")
-
-st.caption(
-    "A Groq-first weather agent with Gemini fallback and "
-    "persistent conversation memory."
-)
-
-
-# ------------------------------------
-# Load Streamlit Cloud secrets
-# ------------------------------------
-
 def load_streamlit_secrets_into_environment():
-    """
-    Load secrets from Streamlit Community Cloud into environment variables.
-
-    Locally, the application uses the .env file.
-    On Streamlit Community Cloud, it uses st.secrets.
-    """
-
+    """Copy Streamlit Cloud secrets into environment variables once at startup."""
     required_keys = [
         "GROQ_API_KEY",
-        "GOOGLE_API_KEY",
         "OPENWEATHER_API_KEY",
+        "SUPABASE_DB_URI",
     ]
 
     for key in required_keys:
@@ -55,18 +26,19 @@ def load_streamlit_secrets_into_environment():
 
             if value:
                 os.environ[key] = str(value)
-
         except Exception:
-            # Locally, .env will be used instead.
+            # Local development uses values loaded from .env.
             pass
 
 
 load_streamlit_secrets_into_environment()
 
+st.set_page_config(
+    page_title="Weather Assistant",
+    page_icon="☀️",
+    layout="centered",
+)
 
-# ------------------------------------
-# Agent configuration
-# ------------------------------------
 
 SYSTEM_PROMPT = """
 You are a helpful weather assistant.
@@ -74,348 +46,193 @@ You are a helpful weather assistant.
 YOUR WORKFLOW:
 
 1. If the user asks about weather WITHOUT specifying a location, you MUST:
-   - First call get_location() to find their location.
-   - Then call get_weather(city) with that location.
-
+   - First call get_location() to find the user's location.
+   - Then call get_weather(city) using the location returned by get_location().
 2. If the user provides a city, call get_weather(city) directly.
-
-3. Use the weather tool result.
-   Do not invent weather data.
-
-4. Present the following information whenever available:
-   - City
-   - Country
-   - Weather condition
-   - Temperature in Celsius
-   - Temperature in Fahrenheit
-   - Humidity
-   - Wind speed
+3. Clearly explain the weather conditions and temperature.
+4. Include both Celsius and Fahrenheit when temperature data is available.
 """
 
 
-@st.cache_resource
-def build_agent():
-    """
-    Build the agent once and reuse it across Streamlit reruns.
-    """
+def get_secret(name: str) -> str | None:
+    """Read a value loaded from .env or Streamlit Cloud secrets."""
+    value = os.getenv(name)
+    return value.strip() if value else None
 
-    # Groq is the primary model.
-    groq = ChatGroq(
+
+def require_secret(name: str) -> str:
+    value = get_secret(name)
+
+    if not value:
+        raise RuntimeError(
+            f"Missing {name}. Add it to .env locally or to Streamlit "
+            "Community Cloud app Secrets."
+        )
+    return value
+
+
+def get_weather(city: str):
+    """Get current weather for a city from OpenWeatherMap."""
+    api_key = require_secret("OPENWEATHER_API_KEY")
+    base_url = "https://api.openweathermap.org/data/2.5/weather"
+
+    response = requests.get(
+        base_url,
+        params={
+            "q": city,
+            "appid": api_key,
+            "units": "metric",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    temperature_celsius = float(data["main"]["temp"])
+    temperature_fahrenheit = temperature_celsius * 9 / 5 + 32
+
+    return {
+        "city": data.get("name", city),
+        "country": data.get("sys", {}).get("country"),
+        "condition": data.get("weather", [{}])[0].get("description"),
+        "temperature_celsius": round(temperature_celsius, 1),
+        "temperature_fahrenheit": round(temperature_fahrenheit, 1),
+        "humidity_percent": data.get("main", {}).get("humidity"),
+        "wind_speed_meters_per_second": data.get("wind", {}).get("speed"),
+    }
+
+
+def get_location():
+    """Estimate the server's public-IP location when no city is provided."""
+    response = requests.get(
+        "https://ipapi.co/json/",
+        headers={"User-Agent": "weather-assistant/1.0"},
+        timeout=15,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    city = data.get("city")
+    country = data.get("country_name")
+
+    if not city:
+        raise RuntimeError("Could not determine a location automatically.")
+
+    return f"{city}, {country}" if country else city
+
+
+def build_agent():
+    """Build one agent/checkpointer pair for the current request."""
+    llm = ChatGroq(
         model="openai/gpt-oss-120b",
         temperature=0.7,
+        api_key=require_secret("GROQ_API_KEY"),
     )
 
-    # Gemini is the fallback model.
-    gemini = ChatGoogleGenerativeAI(
-        model="gemini-3.8-flash",
-        temperature=1.0,
-        max_retries=0,
-    )
+    db_uri = require_secret("SUPABASE_DB_URI")
+    checkpointer_context = PostgresSaver.from_conn_string(db_uri)
+    checkpointer = checkpointer_context.__enter__()
+    checkpointer.setup()
 
-    # Groq is tried first.
-    # Gemini is used automatically if Groq fails.
-    return create_agent(
-        model=groq,
-        tools=[
-            get_weather,
-            get_location,
-        ],
-        middleware=[
-            ModelFallbackMiddleware(gemini),
-        ],
+    agent = create_agent(
+        model=llm,
+        tools=[get_weather, get_location],
         system_prompt=SYSTEM_PROMPT,
-        checkpointer=InMemorySaver(),
+        checkpointer=checkpointer,
     )
 
+    return agent, checkpointer_context
 
-agent = build_agent()
 
+def run_agent(user_query: str, thread_id: str) -> str:
+    """Run the agent and close the database connection after the request."""
+    agent, checkpointer_context = build_agent()
 
-# ------------------------------------
-# Helper functions
-# ------------------------------------
+    try:
+        response = agent.invoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": user_query,
+                    }
+                ]
+            },
+            {
+                "configurable": {
+                    "thread_id": thread_id,
+                }
+            },
+        )
+    finally:
+        checkpointer_context.__exit__(None, None, None)
 
-def content_to_text(content):
-    """
-    Convert LangChain message content into text
-    that Streamlit can display.
-    """
+    final_message = response["messages"][-1]
+    content = final_message.content
 
     if isinstance(content, str):
         return content
 
     if isinstance(content, list):
-        parts = []
-
-        for item in content:
-            if isinstance(item, dict) and "text" in item:
-                parts.append(str(item["text"]))
-            else:
-                parts.append(str(item))
-
-        return "\n".join(parts)
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("text"):
+                text_parts.append(block["text"])
+            elif block:
+                text_parts.append(str(block))
+        return "\n".join(text_parts)
 
     return str(content)
 
 
-def message_summary(message):
-    """
-    Create a readable summary of a LangChain message.
-    """
+st.title("Weather Assistant")
+st.caption("Ask about the weather in any city.")
 
-    return {
-        "message_class": type(message).__name__,
-        "message_type": getattr(message, "type", None),
-        "content": content_to_text(
-            getattr(message, "content", None)
-        ),
-        "tool_calls": getattr(message, "tool_calls", None),
-        "additional_kwargs": getattr(
-            message,
-            "additional_kwargs",
-            {},
-        ),
-        "response_metadata": getattr(
-            message,
-            "response_metadata",
-            {},
-        ),
-    }
-
-
-# ------------------------------------
-# Streamlit session state
-# ------------------------------------
-
-# A thread ID is created once for this browser session.
-# Every question in this session uses the same ID.
 if "thread_id" not in st.session_state:
-    st.session_state.thread_id = (
-        f"weather-thread-{uuid4()}"
-    )
+    # A unique ID prevents different visitors from sharing one conversation.
+    st.session_state.thread_id = str(uuid.uuid4())
 
-
-# These messages are used to display the chat in Streamlit.
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []
-
-
-# This counts the messages already returned by the LangGraph agent.
-if "agent_message_count" not in st.session_state:
-    st.session_state.agent_message_count = 0
-
-
-# ------------------------------------
-# Sidebar
-# ------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": "Hello! Ask me about the weather in a city.",
+        }
+    ]
 
 with st.sidebar:
-    st.subheader("Conversation")
-
-    st.caption(
-        f"Thread ID: `{st.session_state.thread_id}`"
-    )
-
-    st.info(
-        "All questions in this browser session use the same "
-        "thread ID, so the agent can remember the conversation."
-    )
-
-    if st.button("🗑️ Clear chat and start a new thread"):
-        st.session_state.chat_messages = []
-        st.session_state.agent_message_count = 0
-        st.session_state.thread_id = (
-            f"weather-thread-{uuid4()}"
-        )
-
+    st.header("Conversation")
+    if st.button("Clear chat", use_container_width=True):
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.messages = []
         st.rerun()
 
-
-# ------------------------------------
-# Display previous chat messages
-# ------------------------------------
-
-for message in st.session_state.chat_messages:
+for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-
-# ------------------------------------
-# New user query
-# ------------------------------------
-
-if prompt := st.chat_input(
-    "Ask about the current weather..."
-):
-    # Display and store the user's message.
-    st.session_state.chat_messages.append(
-        {
-            "role": "user",
-            "content": prompt,
-        }
-    )
-
+if prompt := st.chat_input("What is the weather in Rome?"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
         with st.spinner("Checking the weather..."):
             try:
-                previous_message_count = (
-                    st.session_state.agent_message_count
-                )
-
-                # The checkpointer remembers previous messages
-                # associated with this thread_id.
-                #
-                # Only the new user message is sent here.
-                result = agent.invoke(
-                    {
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": prompt,
-                            }
-                        ]
-                    },
-                    config={
-                        "configurable": {
-                            "thread_id": (
-                                st.session_state.thread_id
-                            ),
-                        }
-                    },
-                )
-
-                all_agent_messages = result["messages"]
-
-                new_steps = all_agent_messages[
-                    previous_message_count:
-                ]
-
-                st.session_state.agent_message_count = (
-                    len(all_agent_messages)
-                )
-
-                answer = content_to_text(
-                    all_agent_messages[-1].content
-                )
-
-            except Exception as error:
+                answer = run_agent(prompt, st.session_state.thread_id)
+            except requests.HTTPError as exc:
                 answer = (
-                    f"Sorry, something went wrong: {error}"
+                    "I could not retrieve the weather service response. "
+                    f"Please check the city name and API key. Details: {exc}"
                 )
-                new_steps = []
+            except Exception as exc:
+                answer = f"Something went wrong: {exc}"
 
         st.markdown(answer)
 
-        # Store the assistant's answer for the next rerun.
-        st.session_state.chat_messages.append(
-            {
-                "role": "assistant",
-                "content": answer,
-            }
-        )
-
-        # ------------------------------------
-        # Show agent steps
-        # ------------------------------------
-
-        if new_steps:
-            with st.expander("🔧 Agent steps"):
-                model_names = set()
-
-                for message in new_steps:
-                    metadata = (
-                        getattr(
-                            message,
-                            "response_metadata",
-                            {},
-                        )
-                        or {}
-                    )
-
-                    model_name = metadata.get(
-                        "model_name"
-                    )
-
-                    if model_name:
-                        model_names.add(str(model_name))
-
-                    if getattr(message, "type", None) == "ai":
-                        tool_calls = (
-                            getattr(
-                                message,
-                                "tool_calls",
-                                [],
-                            )
-                            or []
-                        )
-
-                        for call in tool_calls:
-                            st.markdown(
-                                f"**Called** "
-                                f"`{call.get('name')}` "
-                                f"with "
-                                f"`{call.get('args')}`"
-                            )
-
-                    elif getattr(message, "type", None) == "tool":
-                        tool_name = getattr(
-                            message,
-                            "name",
-                            "tool",
-                        )
-
-                        st.markdown(
-                            f"**Result from** "
-                            f"`{tool_name}`:"
-                        )
-
-                        st.code(
-                            content_to_text(
-                                message.content
-                            )
-                        )
-
-                if model_names:
-                    st.caption(
-                        "Answered by: "
-                        + ", ".join(
-                            sorted(model_names)
-                        )
-                    )
-
-        # ------------------------------------
-        # Show response structure
-        # ------------------------------------
-
-        if new_steps:
-            with st.expander(
-                "🔎 Response structure"
-            ):
-                st.write(
-                    "Response type:",
-                    type(result).__name__,
-                )
-
-                st.write(
-                    "Response keys:",
-                    list(result.keys()),
-                )
-
-                st.write(
-                    "Total messages in thread:",
-                    len(all_agent_messages),
-                )
-
-                for index, message in enumerate(
-                    new_steps
-                ):
-                    st.markdown(
-                        f"**Message {index} in this response**"
-                    )
-
-                    st.json(
-                        message_summary(message)
-                    )
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": answer,
+        }
+    )
